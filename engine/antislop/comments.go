@@ -1,0 +1,218 @@
+package antislop
+
+import (
+	"path/filepath"
+	"strings"
+
+	"github.com/matej/antislop/engine"
+)
+
+// Verb stems that indicate trivial comments when they start a comment body.
+// Each stem may be followed by optional suffixes: e, es, ing, s.
+var trivialVerbStems = map[string]bool{
+	"import": true, "defin": true, "initializ": true, "setting": true,
+	"setup": true, "return": true, "check": true, "loop": true,
+	"iterat": true, "creat": true, "updat": true, "delet": true,
+	"remov": true, "handl": true, "get": true, "fetch": true,
+	"increment": true, "decrement": true, "writ": true, "runn": true,
+	"run": true, "pars": true, "execut": true, "extract": true,
+	"sav": true, "load": true, "build": true, "start": true,
+	"stopp": true, "stop": true, "cleanup": true, "configur": true,
+	"validat": true, "process": true, "queue": true, "fire": true,
+	"emit": true, "dispatch": true, "log": true, "print": true,
+	"render": true, "clean": true,
+}
+
+var verbSuffixes = []string{"", "e", "es", "ing", "s"}
+
+var explanatoryKeywordSet = map[string]bool{
+	"because": true, "since": true, "note": true, "todo": true,
+	"fixme": true, "hack": true, "warn": true, "warning": true,
+	"workaround": true, "caveat": true, "important": true,
+	"assume": true, "assumes": true,
+}
+
+var sectionDividerRunes = map[rune]bool{
+	'─': true, '━': true, '═': true, '╌': true, '╍': true,
+	'┄': true, '┅': true, '│': true, '┃': true,
+}
+
+// "This function/method/type/..." nouns for trivial "This X does Y" comments
+var thisNouns = map[string]bool{
+	"function": true, "method": true, "type": true, "struct": true,
+	"interface": true, "variable": true, "constant": true, "class": true,
+}
+
+const maxTrivialCommentLength = 60
+
+func isGoComment(trimmed string) bool {
+	return strings.HasPrefix(trimmed, "//") && !strings.HasPrefix(trimmed, "///") && !strings.HasPrefix(trimmed, "//!")
+}
+
+func isPyComment(trimmed string) bool {
+	return strings.HasPrefix(trimmed, "#") && !strings.HasPrefix(trimmed, "#!")
+}
+
+func getCommentBody(trimmed string) string {
+	if strings.HasPrefix(trimmed, "//") {
+		return strings.TrimSpace(trimmed[2:])
+	}
+	if strings.HasPrefix(trimmed, "#") {
+		return strings.TrimSpace(trimmed[1:])
+	}
+	return trimmed
+}
+
+func containsSectionDivider(s string) bool {
+	for _, r := range s {
+		if sectionDividerRunes[r] {
+			return true
+		}
+	}
+	return false
+}
+
+func isDashDivider(s string) bool {
+	if len(s) >= 3 && s[0] == '-' && s[1] == '-' && s[2] == '-' {
+		return true
+	}
+	runes := []rune(s)
+	if len(runes) >= 3 && runes[0] == '─' && runes[1] == '─' && runes[2] == '─' {
+		return true
+	}
+	return false
+}
+
+// matchesTrivialThisPattern checks for "This function/method/..." patterns
+func matchesTrivialThisPattern(body string) bool {
+	lower := strings.ToLower(body)
+	if !strings.HasPrefix(lower, "this ") {
+		return false
+	}
+	rest := lower[5:]
+	for noun := range thisNouns {
+		if strings.HasPrefix(rest, noun+" ") || strings.HasPrefix(rest, noun) {
+			return true
+		}
+	}
+	return false
+}
+
+// matchesTrivialVerbPattern checks if the comment body starts with a trivial verb stem
+func matchesTrivialVerbPattern(body string) bool {
+	firstWord := strings.ToLower(extractFirstWord(body))
+	if firstWord == "" {
+		return false
+	}
+	// Check if firstWord matches stem + optional suffix
+	for stem := range trivialVerbStems {
+		if !strings.HasPrefix(firstWord, stem) {
+			continue
+		}
+		remaining := firstWord[len(stem):]
+		for _, suf := range verbSuffixes {
+			if remaining == suf {
+				return true
+			}
+		}
+	}
+	// Handle "set up" (two-word stem)
+	lower := strings.ToLower(body)
+	if strings.HasPrefix(lower, "set up") || strings.HasPrefix(lower, "setting up") {
+		return true
+	}
+	return false
+}
+
+func isTrivialComment(trimmed, nextLine string, hasNext bool, ext string) bool {
+	isGo := isGoComment(trimmed)
+	isPy := isPyComment(trimmed)
+	if !isGo && !isPy {
+		return false
+	}
+
+	body := getCommentBody(trimmed)
+
+	if len(body) > maxTrivialCommentLength {
+		return false
+	}
+	if containsAnyWord(strings.ToLower(body), explanatoryKeywordSet) {
+		return false
+	}
+	if strings.Contains(body, "(") && strings.Contains(body, ")") {
+		return false
+	}
+	if strings.ContainsAny(body, "({=;}]>") {
+		return false
+	}
+	// Skip section dividers (followed by blank line)
+	if hasNext && strings.TrimSpace(nextLine) == "" {
+		return false
+	}
+	if containsSectionDivider(body) || isDashDivider(body) {
+		return false
+	}
+
+	// Check "This function/method/..." pattern
+	if matchesTrivialThisPattern(body) {
+		return true
+	}
+	// Check verb stem pattern
+	if matchesTrivialVerbPattern(body) {
+		return true
+	}
+
+	return false
+}
+
+func DetectTrivialComments(ctx engine.EngineContext) []engine.Diagnostic {
+	var diags []engine.Diagnostic
+
+	for _, filePath := range ctx.Files {
+		ext := filepath.Ext(filePath)
+		if ext != ".go" && ext != ".py" {
+			continue
+		}
+
+		content, err := readFile(filePath)
+		if err != nil {
+			continue
+		}
+		relPath := relativePath(ctx.RootDir, filePath)
+
+		if IsNonProductionPath(relPath) {
+			continue
+		}
+		if isAutoGenerated(content) || isIgnoredFile(content) {
+			continue
+		}
+
+		lines := strings.Split(content, "\n")
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			var nextLine string
+			hasNext := i+1 < len(lines)
+			if hasNext {
+				nextLine = lines[i+1]
+			}
+
+			if !isTrivialComment(trimmed, nextLine, hasNext, ext) {
+				continue
+			}
+
+			diags = append(diags, engine.Diagnostic{
+				FilePath: relPath,
+				Engine:   engine.EngineAntislop,
+				Rule:     "antislop/trivial-comment",
+				Severity: engine.SeverityWarning,
+				Message:  "Trivial comment that restates the code",
+				Help:     "Remove comments that don't add information beyond what the code already expresses",
+				Line:     i + 1,
+				Category: "Antislop",
+				Fixable:  true,
+			})
+		}
+	}
+
+	return diags
+}
