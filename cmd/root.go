@@ -13,6 +13,7 @@ import (
 	"github.com/matej/antislop/engine/lint"
 	"github.com/matej/antislop/engine/quality"
 	"github.com/matej/antislop/engine/security"
+	gitutil "github.com/matej/antislop/git"
 	"github.com/matej/antislop/output"
 	"github.com/matej/antislop/scoring"
 	"github.com/matej/antislop/util"
@@ -24,6 +25,7 @@ var (
 	verbose     bool
 	changesOnly bool
 	stagedOnly  bool
+	excludeDirs []string
 )
 
 func NewRootCmd() *cobra.Command {
@@ -54,6 +56,7 @@ func newScanCmd() *cobra.Command {
 	cmd.Flags().BoolVarP(&verbose, "verbose", "d", false, "Verbose output")
 	cmd.Flags().BoolVar(&changesOnly, "changes", false, "Only scan changed files (git diff)")
 	cmd.Flags().BoolVar(&stagedOnly, "staged", false, "Only scan staged files")
+	cmd.Flags().StringSliceVar(&excludeDirs, "exclude", nil, "Additional directories to exclude (comma-separated)")
 	return cmd
 }
 
@@ -109,10 +112,19 @@ func runScan(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	files, err := util.CollectSourceFiles(absDir, cfg.Include, cfg.Exclude, languages)
+	allExcludes := append(cfg.Exclude, excludeDirs...)
+	files, err := util.CollectSourceFiles(absDir, cfg.Include, allExcludes, languages)
 	if err != nil {
 		return fmt.Errorf("collecting files: %w", err)
 	}
+
+	if changesOnly || stagedOnly {
+		files, err = filterToGitFiles(absDir, files, stagedOnly)
+		if err != nil {
+			return fmt.Errorf("git: %w", err)
+		}
+	}
+
 	if len(files) == 0 {
 		fmt.Println("No source files to scan.")
 		return nil
@@ -326,4 +338,30 @@ func repeatStr(s string, n int) string {
 		result += s
 	}
 	return result
+}
+
+func filterToGitFiles(root string, allFiles []string, staged bool) ([]string, error) {
+	var gitFiles []string
+	var err error
+	if staged {
+		gitFiles, err = gitutil.GetStagedFiles(root)
+	} else {
+		gitFiles, err = gitutil.GetChangedFiles(root)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	gitSet := map[string]bool{}
+	for _, f := range gitFiles {
+		gitSet[f] = true
+	}
+
+	var filtered []string
+	for _, f := range allFiles {
+		if gitSet[f] {
+			filtered = append(filtered, f)
+		}
+	}
+	return filtered, nil
 }

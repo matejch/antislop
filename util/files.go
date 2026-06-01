@@ -16,13 +16,28 @@ var defaultExclude = map[string]bool{
 	"__pycache__":   true,
 	".mypy_cache":   true,
 	".pytest_cache": true,
-	"testdata":      false, // keep but flaggable
+	".venv":         true,
+	"venv":          true,
+	".env":          true,
+	"env":           true,
+	".tox":          true,
+	"site-packages": true,
+	".eggs":         true,
+	".nox":          true,
+	"third_party":   true,
+	"external":      true,
+	"target":        true,
 }
 
 func CollectSourceFiles(root string, include, exclude []string, languages []string) ([]string, error) {
-	excludeSet := map[string]bool{}
+	excludeNames := map[string]bool{}
+	var excludePaths []string
 	for _, e := range exclude {
-		excludeSet[e] = true
+		if strings.Contains(e, "/") || strings.Contains(e, string(filepath.Separator)) {
+			excludePaths = append(excludePaths, filepath.Clean(e))
+		} else {
+			excludeNames[e] = true
+		}
 	}
 
 	extSet := map[string]bool{}
@@ -40,10 +55,22 @@ func CollectSourceFiles(root string, include, exclude []string, languages []stri
 		if err != nil {
 			return nil
 		}
+
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		rel = filepath.ToSlash(rel)
+
 		if d.IsDir() {
 			name := d.Name()
-			if excludeSet[name] || defaultExclude[name] {
+			if excludeNames[name] || defaultExclude[name] {
 				return filepath.SkipDir
+			}
+			for _, ep := range excludePaths {
+				if rel == ep || strings.HasPrefix(rel, ep+"/") {
+					return filepath.SkipDir
+				}
 			}
 			return nil
 		}
